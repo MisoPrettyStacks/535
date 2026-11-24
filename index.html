@@ -289,6 +289,23 @@
       background: #070b12; padding: 10px; border-radius: 6px;
       border: 1px solid var(--border); overflow-x: auto; font-family: var(--mono); font-size: 11px;
     }
+
+    /* Candle Reader */
+    .cr-grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(130px,1fr)); gap:8px; margin:10px 0; }
+    .cr-stat { background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
+    .cr-stat .k { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }
+    .cr-stat .v { font-family:var(--mono); font-size:13px; font-weight:700; margin-top:2px; }
+    .cr-read { background:var(--panel-2); border:1px solid var(--border); border-left:3px solid var(--cyan); border-radius:8px; padding:10px 12px; margin:10px 0; }
+    .cr-chip { display:inline-block; padding:2px 8px; border-radius:999px; font-size:10px; font-weight:700; margin:0 4px 4px 0; border:1px solid var(--border); }
+    .cr-chip.bull { color:var(--green); background:var(--green-dim); border-color:var(--green); }
+    .cr-chip.bear { color:var(--red); background:var(--red-dim); border-color:var(--red); }
+    .cr-chip.neutral { color:var(--amber); background:var(--amber-dim); border-color:var(--amber); }
+    .cr-pat { border:1px solid var(--border); border-radius:8px; padding:8px 10px; margin-bottom:6px; background:var(--panel-2); }
+    .cr-pat b { font-size:12px; }
+    .cr-pat div { font-size:12px; color:var(--muted); margin-top:3px; line-height:1.5; }
+    .cr-h { font-size:11px; font-weight:800; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin:14px 0 6px; }
+    .cr-table td, .cr-table th { padding:5px 8px; vertical-align:middle; text-align:left; }
+    .cr-note { font-size:10px; color:var(--muted); margin-top:10px; }
   </style>
 </head>
 <body>
@@ -384,6 +401,7 @@
           <input type="number" step="0.0001" id="strikeInput" style="width:92px;" placeholder="Auto" />
           <button onclick="lockWindowOpenStrike()">Lock Open Strike</button>
           <button onclick="clearManualStrike()">Auto</button>
+          <button class="primary" onclick="openCandleReader()">🕯 Candle Reader</button>
         </div>
       </div>
 
@@ -619,6 +637,21 @@
         <button onclick="closeWhitepaperModal()">✖ Close</button>
       </div>
       <div class="modal-body" id="wpContent"></div>
+    </div>
+  </div>
+
+  <!-- CANDLE READER MODAL -->
+  <div class="modal-backdrop" id="crModal" onclick="if(event.target===this)closeCandleReader()">
+    <div class="modal">
+      <div class="card-header" style="padding:12px 18px;background:#0a101b;">
+        <div class="card-title">🕯 Candle Reader — Pattern Identification &amp; Plain-Language Translation</div>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <button id="crTf1" onclick="setReaderTf(1)">1m</button>
+          <button id="crTf5" onclick="setReaderTf(5)">5m</button>
+          <button onclick="closeCandleReader()">✖ Close</button>
+        </div>
+      </div>
+      <div class="modal-body" id="crContent"></div>
     </div>
   </div>
 
@@ -1553,6 +1586,229 @@ function rejectCalibration() {
 /* ============================================================================
  * 8. INTERACTIVE HIGH-DPI CANVAS CHART WITH FORECAST CONE
  * ==========================================================================*/
+
+/* ============================================================================
+ * CANDLE READER: pattern identification + plain-language translation
+ * ==========================================================================*/
+let readerTf = 1, readerTimer = null;
+
+function readerCandles(tf) {
+  if (tf === 1) return state.candles1m.slice(-120).map(c => ({ ...c }));
+  const map = new Map();
+  for (const c of state.candles1m) {
+    const b = Math.floor(c.t / 300000) * 300000;
+    const cur = map.get(b);
+    if (!cur) map.set(b, { ...c, t: b });
+    else { cur.h = Math.max(cur.h, c.h); cur.l = Math.min(cur.l, c.l); cur.c = c.c; cur.v = (cur.v || 0) + (c.v || 0); }
+  }
+  return [...map.values()].slice(-60);
+}
+
+function candleAnatomy(c, atr) {
+  const range = Math.max(c.h - c.l, 1e-9);
+  const body = Math.abs(c.c - c.o);
+  const top = Math.max(c.o, c.c), bot = Math.min(c.o, c.c);
+  return {
+    range, body, up: c.c >= c.o,
+    bodyPct: body / range, upPct: (c.h - top) / range, loPct: (bot - c.l) / range,
+    sizeVsAtr: atr > 0 ? range / atr : 1
+  };
+}
+
+function trendBefore(cs, i, n = 6) {
+  if (i < n) return 0;
+  const a = cs[i - n].c, b = cs[i - 1].c;
+  const atr = avgRange(cs, i, 14) || 1e-9;
+  const move = (b - a) / atr;
+  return move > 1.5 ? 1 : move < -1.5 ? -1 : 0;   // 1 up, -1 down, 0 sideways
+}
+function avgRange(cs, i, n) {
+  const sl = cs.slice(Math.max(0, i - n), i);
+  if (!sl.length) return 0;
+  return sl.reduce((s, c) => s + (c.h - c.l), 0) / sl.length;
+}
+
+function detectPatterns(cs, i) {
+  const out = [];
+  const c = cs[i]; if (!c) return out;
+  const atr = avgRange(cs, i, 14) || (c.h - c.l) || 1e-9;
+  const A = candleAnatomy(c, atr);
+  const tr = trendBefore(cs, i);
+  const push = (name, bias, plain, strength) => out.push({ name, bias, plain, strength, i });
+  if (A.range < atr * 0.05) return out;
+
+  // ---- 3-candle patterns
+  if (i >= 2) {
+    const c1 = cs[i - 2], c2 = cs[i - 1];
+    const a1 = candleAnatomy(c1, atr), a2 = candleAnatomy(c2, atr);
+    const mid1 = (c1.o + c1.c) / 2;
+    if (!a1.up && a1.bodyPct > 0.5 && a2.bodyPct < 0.3 && A.up && A.bodyPct > 0.4 && c.c > mid1 && tr <= 0)
+      push("Morning Star", "bull", "Sellers pushed hard, then stalled into an indecisive candle, and buyers just took back more than half the drop. Selling pressure looks exhausted; a bounce is more likely than not.", 3);
+    if (a1.up && a1.bodyPct > 0.5 && a2.bodyPct < 0.3 && !A.up && A.bodyPct > 0.4 && c.c < mid1 && tr >= 0)
+      push("Evening Star", "bear", "Buyers pushed hard, hesitated, and sellers have now erased more than half of the rally. Buying momentum looks spent; a pullback is more likely.", 3);
+    if ([c1, c2, c].every(x => x.c > x.o) && c2.c > c1.c && c.c > c2.c && c2.o > c1.o && c.o > c2.o && a1.bodyPct > 0.5 && a2.bodyPct > 0.5 && A.bodyPct > 0.5)
+      push("Three White Soldiers", "bull", "Three consecutive strong green candles, each closing higher than the last. Steady, committed buying, not a one-off spike.", 3);
+    if ([c1, c2, c].every(x => x.c < x.o) && c2.c < c1.c && c.c < c2.c && c2.o < c1.o && c.o < c2.o && a1.bodyPct > 0.5 && a2.bodyPct > 0.5 && A.bodyPct > 0.5)
+      push("Three Black Crows", "bear", "Three consecutive strong red candles, each closing lower than the last. Persistent, committed selling.", 3);
+  }
+
+  // ---- 2-candle patterns
+  if (i >= 1) {
+    const p = cs[i - 1], P = candleAnatomy(p, atr);
+    const pTop = Math.max(p.o, p.c), pBot = Math.min(p.o, p.c);
+    const cTop = Math.max(c.o, c.c), cBot = Math.min(c.o, c.c);
+    if (!P.up && A.up && cTop >= pTop && cBot <= pBot && A.body > P.body * 1.05)
+      push("Bullish Engulfing", "bull", "A green candle fully swallowed the prior red one. Buyers overpowered sellers in a single bar; strongest after a decline.", tr < 0 ? 3 : 2);
+    if (P.up && !A.up && cTop >= pTop && cBot <= pBot && A.body > P.body * 1.05)
+      push("Bearish Engulfing", "bear", "A red candle fully swallowed the prior green one. Sellers overpowered buyers in a single bar; strongest after a rally.", tr > 0 ? 3 : 2);
+    if (P.bodyPct > 0.5 && P.sizeVsAtr > 0.9 && A.body < P.body * 0.5 && cTop <= pTop && cBot >= pBot) {
+      if (!P.up) push("Bullish Harami", "bull", "A small candle is contained inside a large red one. The selling push lost steam; possible pause or reversal up.", tr < 0 ? 2 : 1);
+      else push("Bearish Harami", "bear", "A small candle is contained inside a large green one. The buying push lost steam; possible pause or reversal down.", tr > 0 ? 2 : 1);
+    }
+    if (!P.up && A.up && P.bodyPct > 0.5 && c.o < p.c && c.c > (p.o + p.c) / 2 && c.c < p.o)
+      push("Piercing Line", "bull", "After a red candle, price gapped lower but buyers drove it back above the midpoint of that candle. Dip-buyers stepped in.", 2);
+    if (P.up && !A.up && P.bodyPct > 0.5 && c.o > p.c && c.c < (p.o + p.c) / 2 && c.c > p.o)
+      push("Dark Cloud Cover", "bear", "After a green candle, price gapped higher but sellers dragged it back below the midpoint. Rally-sellers stepped in.", 2);
+    const tol = atr * 0.1;
+    if (Math.abs(c.h - p.h) < tol && P.up && !A.up && tr >= 0)
+      push("Tweezer Top", "bear", "Two candles topped out at nearly the same price and turned from green to red. That high is acting as resistance.", 2);
+    if (Math.abs(c.l - p.l) < tol && !P.up && A.up && tr <= 0)
+      push("Tweezer Bottom", "bull", "Two candles bottomed at nearly the same price and turned from red to green. That low is acting as support.", 2);
+  }
+
+  // ---- 1-candle patterns
+  if (A.bodyPct <= 0.1) {
+    if (A.loPct >= 0.6 && A.upPct <= 0.15) push("Dragonfly Doji", "bull", "Price dropped sharply but buyers pushed it all the way back to the open. Strong rejection of lower prices.", tr < 0 ? 2 : 1);
+    else if (A.upPct >= 0.6 && A.loPct <= 0.15) push("Gravestone Doji", "bear", "Price spiked up but sellers pushed it all the way back to the open. Strong rejection of higher prices.", tr > 0 ? 2 : 1);
+    else if (A.upPct > 0.3 && A.loPct > 0.3) push("Long-Legged Doji", "neutral", "Wild swings both ways but the close equals the open. Buyers and sellers are in a stalemate; a big move often follows once it breaks.", 1);
+    else push("Doji", "neutral", "Open and close are almost identical. Indecision: neither side won this candle.", 1);
+  } else if (A.bodyPct >= 0.9) {
+    push(A.up ? "Bullish Marubozu" : "Bearish Marubozu", A.up ? "bull" : "bear",
+      A.up ? "A full-bodied green candle with virtually no wicks: buyers controlled it from open to close."
+           : "A full-bodied red candle with virtually no wicks: sellers controlled it from open to close.", 2);
+  } else if (A.bodyPct <= 0.35 && A.loPct >= 2 * A.bodyPct && A.loPct >= 0.55 && A.upPct <= 0.15) {
+    if (tr < 0) push("Hammer", "bull", "A long lower wick with a small body near the top after a decline. Sellers pushed price down but buyers rejected it. Possible bottom.", 2);
+    else if (tr > 0) push("Hanging Man", "bear", "Hammer shape but after a rally. Sellers showed up intra-bar, a warning that buyers may be tiring (needs a red follow-up to confirm).", 1);
+  } else if (A.bodyPct <= 0.35 && A.upPct >= 2 * A.bodyPct && A.upPct >= 0.55 && A.loPct <= 0.15) {
+    if (tr > 0) push("Shooting Star", "bear", "A long upper wick with a small body near the bottom after a rally. Buyers pushed up but sellers slammed it back. Possible top.", 2);
+    else if (tr < 0) push("Inverted Hammer", "bull", "Long upper wick after a decline. Buyers tested higher prices; needs a green follow-up to confirm a bottom.", 1);
+  } else if (A.bodyPct <= 0.3 && A.upPct >= A.bodyPct && A.loPct >= A.bodyPct) {
+    push("Spinning Top", "neutral", "Small body with wicks on both sides. Tug-of-war with no clear winner; momentum is fading.", 1);
+  }
+  return out.sort((x, y) => y.strength - x.strength);
+}
+
+function describeCandle(c, cs, i) {
+  const atr = avgRange(cs, i, 14) || (c.h - c.l) || 1e-9;
+  const A = candleAnatomy(c, atr);
+  const size = A.sizeVsAtr > 1.8 ? "very large" : A.sizeVsAtr > 1.2 ? "larger-than-normal" : A.sizeVsAtr < 0.5 ? "tiny" : A.sizeVsAtr < 0.8 ? "small" : "average-sized";
+  const dir = A.bodyPct < 0.1 ? "flat (open ≈ close)" : A.up ? "green (buyers won)" : "red (sellers won)";
+  const closePos = (c.c - c.l) / A.range;
+  const where = closePos > 0.8 ? "closed near the high (buyers in control)" : closePos < 0.2 ? "closed near the low (sellers in control)" : "closed mid-range (no clear control)";
+  const wicks = A.loPct > 0.4 ? "a long lower wick shows dips were bought" : A.upPct > 0.4 ? "a long upper wick shows rallies were sold" : "wicks are modest";
+  return { A, atr, size, dir, where, wicks };
+}
+
+function overallRead(cs) {
+  const n = cs.length, i = n - 1;
+  const tr = trendBefore(cs, i + 1 > n ? i : i, 8);
+  const last = cs[i];
+  const d = describeCandle(last, cs, i);
+  const volAvg = cs.slice(-21, -1).reduce((s, c) => s + (c.v || 0), 0) / Math.max(1, cs.slice(-21, -1).length);
+  const vr = volAvg > 0 ? (last.v || 0) / volAvg : 1;
+  const pats = [];
+  for (let k = Math.max(0, i - 2); k <= i; k++) pats.push(...detectPatterns(cs, k));
+  const bull = pats.filter(p => p.bias === "bull").reduce((s, p) => s + p.strength, 0);
+  const bear = pats.filter(p => p.bias === "bear").reduce((s, p) => s + p.strength, 0);
+  const lean = bull - bear >= 2 ? "bull" : bear - bull >= 2 ? "bear" : "neutral";
+  const trendTxt = tr > 0 ? "an up-move" : tr < 0 ? "a down-move" : "sideways chop";
+  let t = `Context: the prior candles show ${trendTxt}. The latest candle is ${d.size} and ${d.dir}; it ${d.where}, and ${d.wicks}.`;
+  if (volAvg > 0) t += ` Volume is ${vr > 1.5 ? "well above" : vr < 0.6 ? "well below" : "near"} the recent average (${vr.toFixed(1)}×)${vr > 1.5 ? ", so this move has real participation" : vr < 0.6 ? ", so treat this move with suspicion" : ""}.`;
+  if (lean === "bull") t += " Net read of the last 3 candles: patterns lean BULLISH.";
+  else if (lean === "bear") t += " Net read of the last 3 candles: patterns lean BEARISH.";
+  else t += " Net read of the last 3 candles: no decisive edge from patterns alone.";
+  return { text: t, lean, pats };
+}
+
+function miniGlyph(c, lo, hi) {
+  const H = 30, W = 12, r = Math.max(hi - lo, 1e-9);
+  const y = p => (H - ((p - lo) / r) * (H - 2) - 1).toFixed(1);
+  const col = c.c >= c.o ? "#16c784" : "#ea3943";
+  const yt = Math.min(y(c.o), y(c.c)), yb = Math.max(y(c.o), y(c.c));
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><line x1="6" x2="6" y1="${y(c.h)}" y2="${y(c.l)}" stroke="${col}" stroke-width="1.5"/><rect x="2" width="8" y="${yt}" height="${Math.max(1.5, yb - yt).toFixed(1)}" fill="${col}"/></svg>`;
+}
+
+function fmtP(x) { return "$" + Number(x).toFixed(4); }
+function chipHtml(p) { return `<span class="cr-chip ${p.bias}">${p.bias === "bull" ? "▲" : p.bias === "bear" ? "▼" : "◆"} ${p.name}</span>`; }
+
+function renderCandleReader() {
+  const el = document.getElementById("crContent");
+  const cs = readerCandles(readerTf);
+  document.getElementById("crTf1").classList.toggle("active", readerTf === 1);
+  document.getElementById("crTf5").classList.toggle("active", readerTf === 5);
+  if (cs.length < 8) {
+    el.innerHTML = `<div class="cr-read">Waiting for candle data… (${cs.length} candles loaded). Needs at least 8 candles; live Coinbase/Kraken candles populate within a few seconds of connecting.</div>`;
+    return;
+  }
+  const i = cs.length - 1, last = cs[i];
+  const d = describeCandle(last, cs, i);
+  const read = overallRead(cs);
+  const latestPats = detectPatterns(cs, i);
+  const leanTxt = { bull: "BULLISH LEAN", bear: "BEARISH LEAN", neutral: "NEUTRAL / NO EDGE" }[read.lean];
+  const leanCol = { bull: "var(--green)", bear: "var(--red)", neutral: "var(--amber)" }[read.lean];
+
+  let h = `<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
+    <div style="font-size:11px;color:var(--muted);">Reading the <b>${readerTf}m</b> XRP-USD candle series live (${cs.length} candles). Last candle is still forming.</div>
+    <div style="font-weight:800;color:${leanCol};font-size:13px;">${leanTxt}</div></div>`;
+
+  h += `<div class="cr-grid">
+    <div class="cr-stat"><div class="k">Open</div><div class="v">${fmtP(last.o)}</div></div>
+    <div class="cr-stat"><div class="k">High</div><div class="v">${fmtP(last.h)}</div></div>
+    <div class="cr-stat"><div class="k">Low</div><div class="v">${fmtP(last.l)}</div></div>
+    <div class="cr-stat"><div class="k">Close / Now</div><div class="v" style="color:${last.c >= last.o ? "var(--green)" : "var(--red)"}">${fmtP(last.c)}</div></div>
+    <div class="cr-stat"><div class="k">Body of range</div><div class="v">${(d.A.bodyPct * 100).toFixed(0)}%</div></div>
+    <div class="cr-stat"><div class="k">Upper / Lower wick</div><div class="v">${(d.A.upPct * 100).toFixed(0)}% / ${(d.A.loPct * 100).toFixed(0)}%</div></div>
+    <div class="cr-stat"><div class="k">Size vs avg range</div><div class="v">${d.A.sizeVsAtr.toFixed(2)}×</div></div>
+  </div>`;
+
+  h += `<div class="cr-h">Plain-language translation</div><div class="cr-read" style="border-left-color:${leanCol}">${read.text}</div>`;
+
+  h += `<div class="cr-h">Pattern(s) on the latest candle</div>`;
+  if (!latestPats.length) h += `<div class="cr-pat"><b>No classic pattern</b><div>This candle doesn't match a recognized formation. That is normal; most candles are just ordinary price movement.</div></div>`;
+  else h += latestPats.map(p => `<div class="cr-pat">${chipHtml(p)}<div>${p.plain}</div></div>`).join("");
+
+  h += `<div class="cr-h">Recent candles, identified &amp; translated (newest first)</div>
+    <div style="overflow-x:auto"><table class="cr-table"><thead><tr><th>Time</th><th></th><th>O → C</th><th>Pattern</th><th>Translation</th></tr></thead><tbody>`;
+  const lo = Math.min(...cs.slice(-14).map(c => c.l)), hi = Math.max(...cs.slice(-14).map(c => c.h));
+  for (let k = i; k >= Math.max(0, i - 13); k--) {
+    const c = cs[k], pats = detectPatterns(cs, k), dd = describeCandle(c, cs, k);
+    const tm = new Date(c.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const trans = pats.length ? pats[0].plain : `${dd.size[0].toUpperCase() + dd.size.slice(1)} ${dd.dir.split(" (")[0]} candle; ${dd.where}.`;
+    h += `<tr style="border-top:1px solid var(--border)"><td style="font-family:var(--mono);white-space:nowrap">${tm}${k === i ? " ●" : ""}</td>
+      <td>${miniGlyph(c, lo, hi)}</td>
+      <td style="font-family:var(--mono);white-space:nowrap">${Number(c.o).toFixed(4)} → ${Number(c.c).toFixed(4)}</td>
+      <td>${pats.length ? pats.slice(0, 2).map(chipHtml).join("") : '<span style="color:var(--muted)">—</span>'}</td>
+      <td style="color:var(--muted);font-size:11px;min-width:260px">${trans}</td></tr>`;
+  }
+  h += `</tbody></table></div>
+    <div class="cr-note">Candle patterns are probabilistic heuristics, not guarantees. On 1m XRP data they are noisy; they carry more weight at key levels, on high volume, and when other panels (CVD, order-book imbalance, Hurst) agree. Not financial advice.</div>`;
+  el.innerHTML = h;
+}
+
+function openCandleReader() {
+  readerTf = state.timeframeMin === 5 ? 5 : 1;
+  document.getElementById("crModal").classList.add("open");
+  renderCandleReader();
+  clearInterval(readerTimer);
+  readerTimer = setInterval(renderCandleReader, 2000);
+}
+function closeCandleReader() {
+  document.getElementById("crModal").classList.remove("open");
+  clearInterval(readerTimer); readerTimer = null;
+}
+function setReaderTf(m) { readerTf = m; renderCandleReader(); }
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeCandleReader(); });
+
 function getChartCandles() {
   if (state.timeframeMin === 1) return state.candles1m.slice(-80);
   // Aggregate 1m into 5m candles
